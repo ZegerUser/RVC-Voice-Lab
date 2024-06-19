@@ -11,47 +11,65 @@ import uuid
 import json
 
 from so_vits_svc_fork.inference.main import infer
+from so_vits_svc_fork.utils import get_optimal_device
+
+NUM_COMPONENTS = 32
 
 models_path =os.path.join(os.getcwd(), "models/base")
 models =  [os.path.join(models_path, f) for f in os.listdir(models_path) if f.endswith('.pth')]
-component_samples = os.listdir(os.path.join(os.getcwd(), "samples/components"))
+config_paths = [os.path.join(models_path, f) for f in os.listdir(models_path) if f.endswith('.json')]
+configs = [] 
+for path in config_paths:
+    with open(path, "r") as f:
+        configs.append(json.load(f))
+
+component_samples = []
 audio_path = os.path.join(os.getcwd(), "samples/audio")
 audio_samples = [os.path.join(audio_path, f) for f in os.listdir(audio_path)]
 
 loaded_model = None
+loaded_index = None
 KEYS =  ["pca_mean", "components", "explained_var", "mu_reduced", "sigma_reduced"]
 def load_model(index):
-    global loaded_model
+    global loaded_model, loaded_index
     loaded_model = torch.load(models[index], map_location="cpu")
-    if "project_voice" not in loaded_model.keys():
+    loaded_index = index
+
+    if "voice_lab" not in loaded_model.keys():
         return "Model not supported"
     
-    if not all(key in loaded_model["project_voice"] for key in KEYS):
+    if not all(key in loaded_model["voice_lab"] for key in KEYS):
         return "Model has not all keys"
     
-    return "Model loaded succesful"
+    sample_names = list(configs[index]["spk"].keys())
+    sample_names.remove("new_spk")
+
+    return "Model loaded succesful", gr.Dropdown.update(choices=sample_names)
 
 def randomize_sliders():
     if loaded_model == None:
-        return "No Model Selected", *[0 for _ in range(16)]
+        return "No Model Selected", *[0 for _ in range(NUM_COMPONENTS)]
 
-    return "Randomized succesful", *np.random.multivariate_normal(loaded_model["project_voice"]["mu_reduced"], loaded_model["project_voice"]["sigma_reduced"])
+    return "Randomized succesful", *np.random.multivariate_normal(loaded_model["voice_lab"]["mu_reduced"], loaded_model["voice_lab"]["sigma_reduced"])
 
-def sliders_to_emb(*sliders):
+def sliders_to_emb(scaling, *sliders):
     global loaded_model
-    pca = PCA(n_components=loaded_model["project_voice"]["components"].shape[0])
-    pca.mean_ = loaded_model["project_voice"]["pca_mean"]
-    pca.components_ = loaded_model["project_voice"]["components"]
-    pca.explained_variance_ = loaded_model["project_voice"]["explained_var"]
+    pca = PCA(n_components=loaded_model["voice_lab"]["components"].shape[0])
+    pca.mean_ = loaded_model["voice_lab"]["pca_mean"]
+    pca.components_ = loaded_model["voice_lab"]["components"]
+    pca.explained_variance_ = loaded_model["voice_lab"]["explained_var"]
 
-    return pca.inverse_transform(sliders)
 
-def generate_preview(sample_index, *sliders):
-    global loaded_model
+    scaled =  np.asarray(sliders[0]) * scaling
+
+    return pca.inverse_transform(sliders) 
+
+def generate_preview(sample_index, scaling, *sliders):
+    global loaded_model, loaded_index
     if sample_index == None or loaded_model == None:
         return "No sample selected or no model loaded", None
     
-    new_emb = sliders_to_emb(sliders)
+    new_emb = sliders_to_emb(scaling, sliders)
     new_model = copy.deepcopy(loaded_model)
     new_model["model"]["emb_g.weight"] = torch.tensor(new_emb)
 
@@ -62,7 +80,7 @@ def generate_preview(sample_index, *sliders):
     #audio_samples[sample_index]
     audio_ouput_name = os.path.join(os.getcwd(), "samples", "generated", f"{int(uuid.uuid4())}.wav")
 
-    config_path = os.path.join(os.getcwd(), "models/base/config.json")
+    config_path = config_paths[loaded_index]
 
     infer(
         # paths
@@ -75,7 +93,7 @@ def generate_preview(sample_index, *sliders):
         speaker="new_spk",
         cluster_model_path=None,
         transpose=0,
-        auto_predict_f0=False,
+        auto_predict_f0=True,
         cluster_infer_ratio=0,
         noise_scale=0.4,
         f0_method="dio",
@@ -85,18 +103,18 @@ def generate_preview(sample_index, *sliders):
         chunk_seconds=0.5,
         absolute_thresh=False,
         max_chunk_seconds=40,
-        device="cpu",
+        device=get_optimal_device(),
     )
     os.remove(tmp_model_path)
     audio, sr = librosa.load(audio_ouput_name)
     return "Generated preview", (sr, audio)
 
-def export_model(model_name, *sliders):
+def export_model(model_name, scaling, *sliders):
     global loaded_model
     if model_name == None or model_name.strip() == "" or loaded_model == None:
         return "No model name or no base model selected"
     
-    new_emb = sliders_to_emb(sliders)
+    new_emb = sliders_to_emb(scaling, sliders)
     new_model = copy.deepcopy(loaded_model)
     new_model["model"]["emb_g.weight"] = torch.tensor(new_emb)
     
@@ -116,6 +134,18 @@ def export_model(model_name, *sliders):
     torch.save(new_model, model_path)
     return f"Saved model to: {model_path}"
 
+def load_example(example_name):
+    global loaded_model, loaded_index
+    if loaded_model == None:
+        return "No base model selected", *[0 for _ in range(NUM_COMPONENTS)]
+    
+    pca = PCA(n_components=loaded_model["voice_lab"]["components"].shape[0])
+    pca.mean_ = loaded_model["voice_lab"]["pca_mean"]
+    pca.components_ = loaded_model["voice_lab"]["components"]
+    pca.explained_variance_ = loaded_model["voice_lab"]["explained_var"]
+
+    return "Loaded Example", *pca.transform([loaded_model["model"]["emb_g.weight"][configs[loaded_index]["spk"][example_name]]])[0]
+
 with gr.Blocks(title="Voice Lab") as demo:
     gr.Markdown("# SO-VITS-SVC Voice Lab")
 
@@ -123,14 +153,17 @@ with gr.Blocks(title="Voice Lab") as demo:
         model_dropdown = gr.Dropdown(label="Load Model", choices=models, interactive=True, type="index", value=0)
 
     with gr.Row():
-        component_dropdown = gr.Dropdown(label="Load Example Components", choices=component_samples, interactive=True)
+        example_dropdown = gr.Dropdown(label="Load Example Components", choices=[], interactive=True)
         randomize_button = gr.Button("Randomize")
 
     component_sliders = []
-    for i in range(4): 
+    for i in range(8): 
         with gr.Row():
             for j in range(4):
-                component_sliders.append(gr.Slider(minimum=-2, maximum=2, step=0.01, value=0, label=f"Component {i*4 + j + 1}", interactive=True))
+                component_sliders.append(gr.Slider(minimum=-5, maximum=5, step=0.01, value=0, label=f"Component {i*4 + j + 1}", interactive=True))
+
+    with gr.Row():
+        scaling = gr.Slider(minimum=0, maximum=10, step=0.01, value=3, label="Scaling Factor", interactive=True)
 
     with gr.Row():
         audio_example_selector = gr.Dropdown(label="Sample audio's", choices=audio_samples, interactive=True, type="index")
@@ -146,11 +179,14 @@ with gr.Blocks(title="Voice Lab") as demo:
     with gr.Row():
         info_text_box = gr.Textbox(label="Info", interactive=False)
 
-    model_dropdown.change(load_model, inputs=model_dropdown, outputs=info_text_box)
+    model_dropdown.change(load_model, inputs=model_dropdown, outputs=[info_text_box, example_dropdown])
+
     randomize_button.click(randomize_sliders, outputs=[info_text_box] + component_sliders)
 
-    preview_button.click(generate_preview, inputs=[audio_example_selector] + component_sliders, outputs=[info_text_box, output_audio])
+    preview_button.click(generate_preview, inputs=[audio_example_selector, scaling] + component_sliders, outputs=[info_text_box, output_audio])
     
-    export_button.click(export_model, inputs=[export_name] + component_sliders, outputs=info_text_box)
+    export_button.click(export_model, inputs=[export_name, scaling] + component_sliders, outputs=info_text_box)
+
+    example_dropdown.change(load_example, inputs=example_dropdown, outputs=[info_text_box] + component_sliders)
 
 demo.launch()

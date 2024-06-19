@@ -1,0 +1,5 @@
+gradio==4.36.1
+librosa==0.10.1
+numpy==1.24.4
+scikit_learn==1.4.0
+so_vits_svc_fork==4.2.9
